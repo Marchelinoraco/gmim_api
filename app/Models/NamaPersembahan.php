@@ -2,10 +2,12 @@
 
 namespace App\Models;
 
+use App\Models\Concerns\BelongsToGereja;
 use Illuminate\Database\Eloquent\Model;
 
 class NamaPersembahan extends Model
 {
+    use BelongsToGereja;
     protected $table = 'nama_persembahan';
 
     protected $keyType = 'string';

@@ -1,0 +1,18 @@
+# Queue worker Laravel (email pengingat, webhook, dll)
+# Simpan ke: /etc/systemd/system/gmim-queue.service
+# Aktifkan: sudo systemctl enable --now gmim-queue
+[Unit]
+Description=GMIM API Queue Worker
+After=network.target mysql.service
+
+[Service]
+User=www-data
+Group=www-data
+Restart=always
+RestartSec=5
+# --tries=3: coba ulang job gagal; --max-time=3600: restart worker tiap jam (cegah memory leak)
+ExecStart=/usr/bin/php /var/www/gmim_api/artisan queue:work --sleep=3 --tries=3 --max-time=3600
+WorkingDirectory=/var/www/gmim_api
+
+[Install]
+WantedBy=multi-user.target

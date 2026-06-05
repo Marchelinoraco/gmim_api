@@ -52,12 +52,18 @@ class MidtransController extends Controller
         $orderId = 'pem-mid-' . Str::ulid();
         $user    = $request->user();
 
+        // Pemasukan online masuk ke pos Midtrans (F-5)
+        $posMidtrans = \App\Models\PosKas::where('gereja_id', $gereja)->where('tipe', 'midtrans')->first();
+
         $pemasukan = Pemasukan::create([
             'id'                      => $orderId,
             'gereja_id'               => $gereja,
+            'pos_kas_id'              => $posMidtrans?->id,
             'sumber'                  => 'midtrans',
             'status'                  => 'pending_payment',
+            'status_kas'              => 'sudah_diterima', // settle = uang masuk saldo Midtrans
             'tanggal'                 => $validated['tanggal'],
+            'tanggal_diterima'        => $validated['tanggal'],
             'kategori_persembahan_id' => $validated['kategoriPersembahanId'],
             'nama_persembahan_id'     => $validated['namaPersembahanId'],
             'jumlah'                  => $validated['jumlah'],

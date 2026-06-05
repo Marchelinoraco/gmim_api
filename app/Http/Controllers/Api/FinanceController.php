@@ -9,6 +9,7 @@ use App\Models\KategoriPersembahan;
 use App\Models\NamaPersembahan;
 use App\Models\Pemasukan;
 use App\Models\Pengeluaran;
+use App\Models\PosKas;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
@@ -24,9 +25,9 @@ class FinanceController extends Controller
     {
         $this->ensureGereja($gereja);
 
-        // Hanya pemasukan yang counted (approved/settled) masuk kalkulasi
-        $pemasukan   = Pemasukan::where('gereja_id', $gereja)->counted()->get();
-        $pengeluaran = Pengeluaran::where('gereja_id', $gereja)->get();
+        // F-1 cash basis — hanya kas yang benar-benar diterima/dikeluarkan
+        $pemasukan   = Pemasukan::where('gereja_id', $gereja)->cash()->get();
+        $pengeluaran = Pengeluaran::where('gereja_id', $gereja)->cash()->get();
         $startOfMonth = now()->startOfMonth()->toDateString();
 
         $recent = $pemasukan
@@ -36,21 +37,107 @@ class FinanceController extends Controller
             ->values()
             ->take(5);
 
-        // Badge jumlah pemasukan menunggu approval (untuk Bendahara)
         $pendingCount = Pemasukan::where('gereja_id', $gereja)->pending()->count();
+
+        // Saldo = Σ saldo semua pos (termasuk saldo_awal & mutasi) — sumber kebenaran tunggal
+        $posList    = PosKas::where('gereja_id', $gereja)->get();
+        $saldoTotal = $posList->sum(fn (PosKas $p) => $p->saldo());
+        $saldoPerPos = $posList->sortBy('urutan')->map(fn (PosKas $p) => [
+            'id' => $p->id, 'nama' => $p->nama, 'tipe' => $p->tipe, 'saldo' => $p->saldo(),
+        ])->values();
 
         return response()->json([
             'success' => true,
             'data' => [
                 'totalPemasukan'           => $pemasukan->sum('jumlah'),
                 'totalPengeluaran'         => $pengeluaran->sum('jumlah'),
-                'saldo'                    => $pemasukan->sum('jumlah') - $pengeluaran->sum('jumlah'),
+                'saldo'                    => $saldoTotal,
                 'totalPemasukanBulanIni'   => $pemasukan->where('tanggal', '>=', $startOfMonth)->sum('jumlah'),
                 'totalPengeluaranBulanIni' => $pengeluaran->where('tanggal', '>=', $startOfMonth)->sum('jumlah'),
+                'saldoPerPos'              => $saldoPerPos,
                 'transaksiTerbaru'         => $recent,
                 'pendingApprovalCount'     => $pendingCount,
             ],
         ]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Dashboard — Grafik
+    // -----------------------------------------------------------------------
+
+    public function dashboardGrafik(Request $request, string $gereja)
+    {
+        $this->ensureGereja($gereja);
+        $range = $request->query('range', 'weekly'); // weekly | monthly
+
+        return $range === 'monthly'
+            ? $this->grafik12Bulan($gereja)
+            : $this->grafik8Minggu($gereja);
+    }
+
+    private function grafik8Minggu(string $gereja)
+    {
+        $buckets = [];
+        for ($i = 7; $i >= 0; $i--) {
+            $start = now()->startOfWeek()->subWeeks($i);
+            $end   = now()->endOfWeek()->subWeeks($i);
+            $buckets[] = [
+                'start' => $start->toDateString(),
+                'end'   => $end->toDateString(),
+                'label' => $start->format('d M'),
+            ];
+        }
+
+        return $this->buildGrafikResponse($gereja, $buckets);
+    }
+
+    private function grafik12Bulan(string $gereja)
+    {
+        $buckets = [];
+        for ($i = 11; $i >= 0; $i--) {
+            $date = now()->startOfMonth()->subMonths($i);
+            $buckets[] = [
+                'start' => $date->toDateString(),
+                'end'   => $date->copy()->endOfMonth()->toDateString(),
+                'label' => $date->isoFormat('MMM YYYY'),
+            ];
+        }
+
+        return $this->buildGrafikResponse($gereja, $buckets);
+    }
+
+    private function buildGrafikResponse(string $gereja, array $buckets)
+    {
+        // Saldo sebelum periode pertama (kas awal) — cash basis + saldo awal pos
+        $periodStart    = $buckets[0]['start'];
+        $saldoAwalPos   = (int) PosKas::where('gereja_id', $gereja)->sum('saldo_awal');
+        $saldoSebelumnya = $saldoAwalPos
+            + Pemasukan::where('gereja_id', $gereja)->cash()
+            ->where('tanggal', '<', $periodStart)->sum('jumlah')
+            - Pengeluaran::where('gereja_id', $gereja)->cash()
+            ->where('tanggal', '<', $periodStart)->sum('jumlah');
+
+        $labels            = [];
+        $pemasukanSeries   = [];
+        $pengeluaranSeries = [];
+        $saldoSeries       = [];
+        $running           = $saldoSebelumnya;
+
+        foreach ($buckets as $b) {
+            $pem = Pemasukan::where('gereja_id', $gereja)->cash()
+                ->whereBetween('tanggal', [$b['start'], $b['end']])->sum('jumlah');
+            $pen = Pengeluaran::where('gereja_id', $gereja)->cash()
+                ->whereBetween('tanggal', [$b['start'], $b['end']])->sum('jumlah');
+
+            $running += $pem - $pen;
+
+            $labels[]            = $b['label'];
+            $pemasukanSeries[]   = $pem;
+            $pengeluaranSeries[] = $pen;
+            $saldoSeries[]       = $running;
+        }
+
+        return $this->ok(compact('labels', 'pemasukanSeries', 'pengeluaranSeries', 'saldoSeries'));
     }
 
     // -----------------------------------------------------------------------
@@ -183,6 +270,7 @@ class FinanceController extends Controller
     public function pemasukanIndex(Request $request, string $gereja)
     {
         $query = Pemasukan::where('gereja_id', $gereja)
+            ->whereNull('reverses')   // sembunyikan entry pembalik (audit-only)
             ->orderByDesc('tanggal')
             ->orderByDesc('created_at');
 
@@ -230,6 +318,16 @@ class FinanceController extends Controller
         // Bendahara input → langsung approved; Pelayan Khusus → pending
         $status = $isBendahara ? 'approved' : 'pending';
 
+        // F-1 cash basis (default sudah diterima). KP-1: pos hanya saat sudah diterima.
+        $statusKas = $validated['statusKas'] ?? 'sudah_diterima';
+        $posKasId  = null;
+        $tanggalDiterima = null;
+        if ($statusKas === 'sudah_diterima') {
+            $pos = $this->findForGereja(PosKas::class, $gereja, $validated['posKasId'], 'Pos kas tidak ditemukan.');
+            $posKasId = $pos->id;
+            $tanggalDiterima = $validated['tanggal'];
+        }
+
         $buktiPath = null;
         if ($request->hasFile('bukti')) {
             $buktiPath = $request->file('bukti')->store(
@@ -241,8 +339,11 @@ class FinanceController extends Controller
         $item = Pemasukan::create([
             'id'                      => 'pem-'.Str::ulid(),
             'gereja_id'               => $gereja,
+            'pos_kas_id'              => $posKasId,
             'sumber'                  => 'manual',
             'status'                  => $status,
+            'status_kas'              => $statusKas,
+            'tanggal_diterima'        => $tanggalDiterima,
             'tanggal'                 => $validated['tanggal'],
             'kategori_persembahan_id' => $validated['kategoriPersembahanId'],
             'nama_persembahan_id'     => $validated['namaPersembahanId'],
@@ -388,6 +489,7 @@ class FinanceController extends Controller
     public function pengeluaranIndex(Request $request, string $gereja)
     {
         $query = Pengeluaran::where('gereja_id', $gereja)
+            ->whereNull('reverses')   // sembunyikan entry pembalik (audit-only)
             ->orderByDesc('tanggal')
             ->orderByDesc('created_at');
         $this->applyDateFilters($query, $request);
@@ -408,13 +510,28 @@ class FinanceController extends Controller
         $validated = $request->validate($this->pengeluaranRules());
         $this->findForGereja(KategoriPengeluaran::class, $gereja, $validated['kategoriPengeluaranId'], 'Kategori tidak ditemukan.');
 
+        $statusKas = $validated['statusKas'] ?? 'sudah_dikeluarkan';
+        $posKasId  = null;
+        $tanggalKeluar = null;
+        if ($statusKas === 'sudah_dikeluarkan') {
+            $pos = $this->findForGereja(PosKas::class, $gereja, $validated['posKasId'], 'Pos kas tidak ditemukan.');
+            // KP-2: tolak keras jika saldo pos tidak cukup
+            abort_if($pos->saldo() < $validated['jumlah'], 422,
+                "Saldo pos {$pos->nama} tidak cukup (Rp " . number_format($pos->saldo(), 0, ',', '.') . "). Lakukan mutasi (transfer antar pos) dulu.");
+            $posKasId = $pos->id;
+            $tanggalKeluar = $validated['tanggal'];
+        }
+
         $item = Pengeluaran::create([
             'id'                    => 'kel-'.Str::ulid(),
             'gereja_id'             => $gereja,
+            'pos_kas_id'            => $posKasId,
             'tanggal'               => $validated['tanggal'],
             'kategori_pengeluaran_id' => $validated['kategoriPengeluaranId'],
             'jumlah'                => $validated['jumlah'],
             'keterangan'            => trim($validated['keterangan']),
+            'status_kas'            => $statusKas,
+            'tanggal_dikeluarkan'   => $tanggalKeluar,
         ]);
 
         return $this->created($this->mapPengeluaran($item));
@@ -457,10 +574,10 @@ class FinanceController extends Controller
         return response()->json([
             'success' => true,
             'data'    => [
-                'pemasukan'   => Pemasukan::where('gereja_id', $gereja)->counted()
+                'pemasukan'   => Pemasukan::where('gereja_id', $gereja)->cash()
                     ->whereBetween('tanggal', [$validated['startDate'], $validated['endDate']])
                     ->get()->map(fn ($item) => $this->mapPemasukan($item)),
-                'pengeluaran' => Pengeluaran::where('gereja_id', $gereja)
+                'pengeluaran' => Pengeluaran::where('gereja_id', $gereja)->cash()
                     ->whereBetween('tanggal', [$validated['startDate'], $validated['endDate']])
                     ->get()->map(fn ($item) => $this->mapPengeluaran($item)),
             ],
@@ -477,10 +594,10 @@ class FinanceController extends Controller
         return response()->json([
             'success' => true,
             'data'    => [
-                'pemasukan'   => Pemasukan::where('gereja_id', $gereja)->counted()
+                'pemasukan'   => Pemasukan::where('gereja_id', $gereja)->cash()
                     ->whereMonth('tanggal', $validated['month'])->whereYear('tanggal', $validated['year'])
                     ->get()->map(fn ($item) => $this->mapPemasukan($item)),
-                'pengeluaran' => Pengeluaran::where('gereja_id', $gereja)
+                'pengeluaran' => Pengeluaran::where('gereja_id', $gereja)->cash()
                     ->whereMonth('tanggal', $validated['month'])->whereYear('tanggal', $validated['year'])
                     ->get()->map(fn ($item) => $this->mapPengeluaran($item)),
             ],
@@ -499,6 +616,9 @@ class FinanceController extends Controller
             'namaPersembahanId'     => ['required', 'string'],
             'jumlah'                => ['required', 'integer', 'min:1'],
             'keterangan'            => ['nullable', 'string'],
+            // F-1 cash basis + KP-1: pos wajib hanya jika kas sudah diterima
+            'statusKas'             => ['nullable', 'in:sudah_diterima,belum_diterima'],
+            'posKasId'              => ['nullable', 'required_if:statusKas,sudah_diterima', 'string'],
         ];
     }
 
@@ -509,6 +629,9 @@ class FinanceController extends Controller
             'kategoriPengeluaranId' => ['required', 'string'],
             'jumlah'                => ['required', 'integer', 'min:1'],
             'keterangan'            => ['required', 'string'],
+            // F-5: pos wajib jika sudah dikeluarkan (default)
+            'statusKas'             => ['nullable', 'in:sudah_dikeluarkan,belum_dikeluarkan'],
+            'posKasId'              => ['nullable', 'required_if:statusKas,sudah_dikeluarkan', 'string'],
         ];
     }
 
@@ -571,8 +694,11 @@ class FinanceController extends Controller
     {
         return $this->mapBase($item) + [
             'gerejaId'               => $item->gereja_id,
+            'posKasId'               => $item->pos_kas_id,
             'sumber'                 => $item->sumber,
             'status'                 => $item->status,
+            'statusKas'              => $item->status_kas,
+            'tanggalDiterima'        => $item->tanggal_diterima?->format('Y-m-d'),
             'tanggal'                => $item->tanggal->format('Y-m-d'),
             'kategoriPersembahanId'  => $item->kategori_persembahan_id,
             'namaPersembahanId'      => $item->nama_persembahan_id,
@@ -583,6 +709,7 @@ class FinanceController extends Controller
             'approvedBy'             => $item->approved_by,
             'approvedAt'             => $item->approved_at?->format('d/m/Y H:i:s'),
             'rejectedReason'         => $item->rejected_reason,
+            'dikoreksi'              => (bool) $item->reversed_by,
         ];
     }
 
@@ -609,10 +736,14 @@ class FinanceController extends Controller
     {
         return $this->mapBase($item) + [
             'gerejaId'              => $item->gereja_id,
+            'posKasId'              => $item->pos_kas_id,
             'tanggal'               => $item->tanggal->format('Y-m-d'),
             'kategoriPengeluaranId' => $item->kategori_pengeluaran_id,
             'jumlah'                => $item->jumlah,
             'keterangan'            => $item->keterangan,
+            'statusKas'             => $item->status_kas,
+            'tanggalDikeluarkan'    => $item->tanggal_dikeluarkan?->format('Y-m-d'),
+            'dikoreksi'             => (bool) $item->reversed_by,
         ];
     }
 
