@@ -22,6 +22,9 @@ use App\Http\Middleware\EnsureUserBelongsToGereja;
 use App\Http\Middleware\SetCurrentGereja;
 use Illuminate\Support\Facades\Route;
 
+//deploy vps
+
+
 // Publik
 Route::get('/health', function () {
     $checks = [];
